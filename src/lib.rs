@@ -364,7 +364,7 @@ impl RendezvousGuard {
 
 impl Drop for Rendezvous {
     fn drop(&mut self) {
-        #[cfg(feature = "log")]
+        #[cfg(all(debug_assertions, feature = "log"))]
         if self.tx.is_some() {
             error!("Implementation error: Rendezvous method not invoked")
         }

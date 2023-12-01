@@ -1,6 +1,6 @@
 [package]
 name = "rendezvous"
-version = "0.1.1"
+version = "0.2.0"
 description = "Easier rendezvous channels for thread synchronization"
 authors = ["Markus Mayer <github@widemeadows.de>"]
 homepage = "https://github.com/sunsided/rendezvous-rs"

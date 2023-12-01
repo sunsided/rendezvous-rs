@@ -269,6 +269,12 @@ impl Rendezvous {
     }
 }
 
+impl Default for Rendezvous {
+    fn default() -> Self {
+        Rendezvous::new()
+    }
+}
+
 impl RendezvousGuard {
     /// Forks a guard off the owning [`Rendezvous`] channel.
     ///

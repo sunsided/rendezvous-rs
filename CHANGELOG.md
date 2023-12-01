@@ -8,6 +8,7 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Added support for the `log` crate.
+- `Rendezvous` now implements `Default`.
 
 ## [0.1.1] - 2023-12-01
 

@@ -17,7 +17,7 @@
 //! use std::time::Duration;
 //! use rendezvous::{Rendezvous, RendezvousGuard};
 //!
-//! //! A slow worker function. Sleeps, then mutates a value.
+//! /// A slow worker function. Sleeps, then mutates a value.
 //! fn slow_worker_fn(_guard: RendezvousGuard, mut value: Arc<Mutex<u32>>) {
 //!     thread::sleep(Duration::from_millis(400));
 //!     let mut value = value.lock().unwrap();

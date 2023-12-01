@@ -9,6 +9,12 @@
 //!
 //! This version of the crate only supports synchronous code due to the dropping semantics.
 //!
+//! ## Crate Features
+//!
+//! * `log` - Enables support for the `log` crate.
+//! * `tokio` - Enables the `rendezvous_async` method to asynchronously wait for the rendezvous
+//!             points to be reached.
+//!
 //! ## Example usage
 //!
 //! ```rust
@@ -50,6 +56,9 @@
 
 #[cfg(feature = "log")]
 use log::{debug, error, trace};
+
+#[cfg(feature = "tokio")]
+use tokio::task::{self, JoinError};
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -126,7 +135,7 @@ impl Rendezvous {
 
     /// Executes the rendezvous process.
     ///
-    /// # Example
+    /// ## Example
     ///
     /// ```
     /// use std::sync::{Arc, Mutex};
@@ -177,9 +186,58 @@ impl Rendezvous {
         self.rendezvous_internal();
     }
 
-    /// Executes the rendezvous process with a timeout..
+    /// Asynchronously executes the rendezvous process.
     ///
-    /// # Example
+    /// ## Usage notes
+    ///
+    /// When the rendezvous channel is dropped without a call to [`Rendezvous::rendezvous_async`],
+    /// the currently executed will block until all rendezvous points are reached.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use std::sync::{Arc, Mutex};
+    /// use std::thread;
+    /// use std::time::Duration;
+    /// use rendezvous::{Rendezvous, RendezvousGuard};
+    ///
+    /// // A slow worker function. Sleeps, then mutates a value.
+    /// fn slow_worker_fn(_guard: RendezvousGuard, mut value: Arc<Mutex<u32>>) {
+    ///     thread::sleep(Duration::from_millis(400));
+    ///     let mut value = value.lock().unwrap();
+    ///     *value = 42;
+    /// }
+    ///
+    /// // The guard that ensures synchronization across threads.
+    /// let rendezvous = Rendezvous::new();
+    ///
+    /// // A value to mutate in a different thread.
+    /// let value = Arc::new(Mutex::new(0u32));
+    ///
+    /// // Run the worker in a thread.
+    /// thread::spawn({
+    ///     let guard = rendezvous.fork_guard();
+    ///     let value = value.clone();
+    ///     move || slow_worker_fn(guard, value)
+    /// });
+    ///
+    /// // Block until the thread has finished its work.
+    /// # tokio_test::block_on(async {
+    /// rendezvous.rendezvous_async().await.ok();
+    /// # });
+    ///
+    /// // The thread finished in time.
+    /// assert_eq!(*(value.lock().unwrap()), 42);
+    /// ```
+    #[cfg(feature = "tokio")]
+    pub async fn rendezvous_async(self) -> Result<(), JoinError> {
+        let handle = task::spawn_blocking(|| self.rendezvous());
+        handle.await
+    }
+
+    /// Executes the rendezvous process with a timeout.
+    ///
+    /// ## Example
     ///
     /// ```
     /// use std::sync::{Arc, Mutex};

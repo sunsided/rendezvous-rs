@@ -111,6 +111,7 @@ impl Rendezvous {
     ///
     /// <div class="warning">
     /// Note that forking and not dropping a guard in the same thread is a deadlock:
+    /// </div>
     ///
     /// ```no_run
     /// use rendezvous::Rendezvous;
@@ -120,7 +121,6 @@ impl Rendezvous {
     /// rendezvous.rendezvous(); // will deadlock
     /// drop(guard);
     /// ```
-    /// </div>
     pub fn fork_guard(&self) -> RendezvousGuard {
         if let Some(tx) = &self.tx {
             #[cfg(feature = "log")]
@@ -172,6 +172,7 @@ impl Rendezvous {
     ///
     /// <div class="warning">
     /// Note that forking and not dropping a guard in the same thread is a deadlock:
+    /// </div>
     ///
     /// ```no_run
     /// use rendezvous::Rendezvous;
@@ -181,7 +182,6 @@ impl Rendezvous {
     /// rendezvous.rendezvous(); // will deadlock
     /// drop(guard);
     /// ```
-    /// </div>
     pub fn rendezvous(mut self) {
         self.rendezvous_internal();
     }
@@ -230,6 +230,7 @@ impl Rendezvous {
     /// assert_eq!(*(value.lock().unwrap()), 42);
     /// ```
     #[cfg(feature = "tokio")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub async fn rendezvous_async(self) -> Result<(), JoinError> {
         let handle = task::spawn_blocking(|| self.rendezvous());
         handle.await
@@ -279,6 +280,7 @@ impl Rendezvous {
     ///
     /// <div class="warning">
     /// Note that forking and not dropping a guard is generally a deadlock, and a timeout will occur:
+    /// </div>
     ///
     /// ```
     /// use std::time::Duration;
@@ -289,7 +291,6 @@ impl Rendezvous {
     /// assert_eq!(rendezvous.rendezvous_timeout(Duration::from_millis(10)), Err(RendezvousTimeoutError::Timeout));
     /// drop(guard);
     /// ```
-    /// </div>
     pub fn rendezvous_timeout(&mut self, timeout: Duration) -> Result<(), RendezvousTimeoutError> {
         if let Some(tx) = self.tx.take() {
             drop(tx);

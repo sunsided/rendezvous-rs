@@ -9,3 +9,9 @@ categories = ["asynchronous"]
 license = "EUPL-1.2"
 readme = "README.md"
 edition = "2021"
+
+[features]
+log = ["dep:log"]
+
+[dependencies]
+log = { version = "0.4.20", optional = true }

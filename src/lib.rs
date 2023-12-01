@@ -48,6 +48,9 @@
 //! }
 //! ```
 
+#[cfg(feature = "log")]
+use log::{debug, error, trace};
+
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::mpsc;
@@ -111,6 +114,10 @@ impl Rendezvous {
     /// </div>
     pub fn fork_guard(&self) -> RendezvousGuard {
         if let Some(tx) = &self.tx {
+            #[cfg(feature = "log")]
+            {
+                trace!("Forking rendezvous guard");
+            }
             RendezvousGuard(tx.clone())
         } else {
             unreachable!("Fork called after Rendezvous is dropped")
@@ -228,11 +235,22 @@ impl Rendezvous {
     pub fn rendezvous_timeout(&mut self, timeout: Duration) -> Result<(), RendezvousTimeoutError> {
         if let Some(tx) = self.tx.take() {
             drop(tx);
+        } else {
+            #[cfg(feature = "log")]
+            {
+                trace!("Rendezvous was called previously, attempting again");
+            }
         }
         match self.rx.recv_timeout(timeout) {
             Ok(_) => Ok(()),
             Err(err) => match err {
-                RecvTimeoutError::Timeout => Err(RendezvousTimeoutError::Timeout),
+                RecvTimeoutError::Timeout => {
+                    #[cfg(feature = "log")]
+                    {
+                        debug!("A timeout occurred during a rendezvous");
+                    }
+                    Err(RendezvousTimeoutError::Timeout)
+                }
                 RecvTimeoutError::Disconnected => Ok(()),
             },
         }
@@ -257,6 +275,10 @@ impl RendezvousGuard {
     /// When all guards are dropped, [`Rendezvous::rendezvous`] will proceed; until then, that
     /// call blocks.
     pub fn fork(&self) -> RendezvousGuard {
+        #[cfg(feature = "log")]
+        {
+            trace!("Forking nested rendezvous guard");
+        }
         RendezvousGuard(self.0.clone())
     }
 
@@ -277,6 +299,10 @@ impl RendezvousGuard {
 
 impl Drop for Rendezvous {
     fn drop(&mut self) {
+        #[cfg(feature = "log")]
+        if self.tx.is_some() {
+            error!("Implementation error: Rendezvous method not invoked")
+        }
         self.rendezvous_internal()
     }
 }

@@ -3,6 +3,12 @@
 All notable changes to this project will be documented in this file.
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Added support for the `log` crate.
+
 ## [0.1.1] - 2023-12-01
 
 ### Fixed

@@ -362,6 +362,12 @@ impl RendezvousGuard {
     pub fn completed(self) {}
 }
 
+impl Clone for RendezvousGuard {
+    fn clone(&self) -> Self {
+        self.fork()
+    }
+}
+
 impl Drop for Rendezvous {
     fn drop(&mut self) {
         #[cfg(all(debug_assertions, feature = "log"))]

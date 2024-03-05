@@ -3,6 +3,15 @@
 All notable changes to this project will be documented in this file.
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2024-03-05
+
+[0.2.3]: https://github.com/sunsided/rendezvous-rs/releases/tag/0.2.3
+
+### Fixed
+
+- [#2](https://github.com/sunsided/rendezvous-rs/pull/2):
+  Fixed a security issue in the `mio` dependency.
+
 ## [0.2.2] - 2023-12-02
 
 ### Fixed

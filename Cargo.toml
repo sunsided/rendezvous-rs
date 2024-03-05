@@ -15,8 +15,8 @@ log = ["dep:log"]
 tokio = ["dep:tokio"]
 
 [dependencies]
-log = { version = "0.4.20", optional = true }
-tokio = { version = "1.34.0", optional = true, features = ["full"] }
+log = { version = "0.4.21", optional = true }
+tokio = { version = "1.36.0", optional = true, features = ["full"] }
 
 [dev-dependencies]
 tokio-test ="0.4.3"

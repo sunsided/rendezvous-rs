@@ -1,6 +1,6 @@
 [package]
 name = "rendezvous"
-version = "0.2.3"
+version = "0.2.2"
 description = "Easier rendezvous channels for thread synchronization"
 authors = ["Markus Mayer <github@widemeadows.de>"]
 homepage = "https://github.com/sunsided/rendezvous-rs"
@@ -15,11 +15,11 @@ log = ["dep:log"]
 tokio = ["dep:tokio"]
 
 [dependencies]
-log = { version = "0.4.21", optional = true }
-tokio = { version = "1.36.0", optional = true, features = ["full"] }
+log = { version = "0.4.20", optional = true }
+tokio = { version = "1.34.0", optional = true, features = ["rt"] }
 
 [dev-dependencies]
-tokio-test ="0.4.3"
+tokio-test = "0.4.3"
 
 [package.metadata.docs.rs]
 all-features = true

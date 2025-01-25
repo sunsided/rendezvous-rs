@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file.
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2025-01-25
+
+[0.3.0]: https://github.com/sunsided/rendezvous-rs/releases/tag/v0.3.0
+
+### Updated
+
+- Removed unused `tokio` features when enabled.
+
+### Internal
+
+- Removed `Cargo.lock` from repository.
+
 ## [0.2.3] - 2024-03-05
 
 [0.2.3]: https://github.com/sunsided/rendezvous-rs/releases/tag/0.2.3
@@ -44,7 +56,11 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Added `Rendezvous` type.
 
 [0.2.2]: https://github.com/sunsided/rendezvous-rs/releases/tag/0.2.2
+
 [0.2.1]: https://github.com/sunsided/rendezvous-rs/releases/tag/0.2.1
+
 [0.2.0]: https://github.com/sunsided/rendezvous-rs/releases/tag/0.2.0
+
 [0.1.1]: https://github.com/sunsided/rendezvous-rs/releases/tag/0.1.1
+
 [0.1.0]: https://github.com/sunsided/rendezvous-rs/releases/tag/0.1.0

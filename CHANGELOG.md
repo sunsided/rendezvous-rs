@@ -3,6 +3,32 @@
 All notable changes to this project will be documented in this file.
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-17
+
+[0.4.0]: https://github.com/sunsided/rendezvous-rs/releases/tag/v0.4.0
+
+### Changed
+
+- Reimplemented the core on an explicit guard counter guarded by a `Mutex`/`Condvar` (plus
+  `tokio::sync::Notify` under the `tokio` feature) instead of `mpsc::channel` drop detection. The
+  waiter no longer relinquishes its own handle, removing the finicky drop-before-`recv` ordering.
+- **Breaking:** `rendezvous_timeout` now consumes `self` and returns
+  `Result<(), (Self, RendezvousTimeoutError)>`, handing the `Rendezvous` back on timeout so retrying
+  or forking more guards is type-enforced rather than convention.
+- **Breaking:** `rendezvous_async` is now truly asynchronous (it parks on a `Notify` rather than
+  `spawn_blocking`) and returns `()` instead of `Result<(), JoinError>`.
+
+### Added
+
+- `rendezvous_timeout_async` (tokio feature): a bounded, cancellable async wait.
+
+### Fixed
+
+- `fork_guard` no longer panics when called after a `rendezvous_timeout` timeout.
+- Dropping a `Rendezvous` after a timeout no longer blocks indefinitely; the caller already opted
+  into bounded-wait semantics, so the destructor returns immediately.
+- The async wait no longer occupies a blocking-pool thread and is cancellable.
+
 ## [0.3.0] - 2025-01-25
 
 [0.3.0]: https://github.com/sunsided/rendezvous-rs/releases/tag/v0.3.0

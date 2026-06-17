@@ -1,19 +1,20 @@
 //! # Easier Rendezvous Channels
 //!
-//! In rust, [mpsc::channel](https://doc.rust-lang.org/std/sync/mpsc/fn.channel.html) can be used as a synchronization
-//! primitive between threads by utilizing the fact that we can block on the receiver's `recv()` function until all senders
-//! are dropped.
+//! A [`Rendezvous`] lets one thread wait until a group of worker threads have all reached a
+//! synchronization point. Each worker holds a [`RendezvousGuard`]; once every guard is dropped,
+//! the waiting [`Rendezvous::rendezvous`] call (or its async/timeout variants) proceeds.
 //!
-//! This crate aims at giving the concept an expressive name and at reducing some classes of race conditions, namely those
-//! where the original sender was not dropped before the call to `recv()`.
-//!
-//! This version of the crate only supports synchronous code due to the dropping semantics.
+//! Internally this is a guard counter protected by a [`Mutex`] and a [`Condvar`] (plus a
+//! [`tokio::sync::Notify`] when the `tokio` feature is enabled). The waiter never relinquishes its
+//! own handle, so forking a guard always works — even after a timed-out wait — and a timeout never
+//! leaves the [`Rendezvous`] in a state where dropping it blocks forever.
 //!
 //! ## Crate Features
 //!
 //! * `log` - Enables support for the `log` crate.
-//! * `tokio` - Enables the `rendezvous_async` method to asynchronously wait for the rendezvous
-//!             points to be reached.
+//! * `tokio` - Enables the [`Rendezvous::rendezvous_async`] and
+//!   [`Rendezvous::rendezvous_timeout_async`] methods to asynchronously wait for the rendezvous
+//!   points to be reached.
 //!
 //! ## Example usage
 //!
@@ -61,29 +62,45 @@
 #[cfg(feature = "log")]
 use log::{debug, error, trace};
 
-#[cfg(feature = "tokio")]
-use tokio::task::{self, JoinError};
-
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::mpsc;
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// [`Rendezvous`] is a synchronization primitive that allows two threads to rendezvous
-/// at a certain point in the code before proceeding.
-pub struct Rendezvous {
-    /// The receiver used for the rendezvous process. If all senders are dropped, the
-    /// receiver allows the [`Rendezvous::rendezvous`] method to pass.
-    rx: mpsc::Receiver<()>,
-    /// The original sender for the rendezvous process. Will be forked using [`Rendezvous::fork_guard`]
-    /// or transiently forked from [`RendezvousGuard::fork`]. If all senders are dropped,
-    /// [`Rendezvous::rendezvous`] can proceed.
-    tx: Option<mpsc::Sender<()>>,
+/// State shared between a [`Rendezvous`] and all of its [`RendezvousGuard`]s.
+struct Shared {
+    /// The number of outstanding [`RendezvousGuard`] instances. The owning [`Rendezvous`] does
+    /// *not* count itself; the rendezvous completes once this reaches zero.
+    count: Mutex<usize>,
+    /// Notifies synchronous waiters when `count` reaches zero.
+    cv: Condvar,
+    /// Notifies asynchronous waiters when `count` reaches zero.
+    #[cfg(feature = "tokio")]
+    notify: tokio::sync::Notify,
 }
 
-/// A guard forked off a [`Rendezvous`] struct.
-pub struct RendezvousGuard(mpsc::Sender<()>);
+impl Shared {
+    /// Locks the guard counter, recovering from poisoning. The counter is a plain `usize` with no
+    /// invariant that a panicking guard thread could break, so recovering is always safe and avoids
+    /// permanently wedging a waiter.
+    fn lock_count(&self) -> MutexGuard<'_, usize> {
+        self.count.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// [`Rendezvous`] is a synchronization primitive that allows a thread to wait until a group of
+/// worker threads have all reached a certain point in the code before proceeding.
+pub struct Rendezvous {
+    /// The shared guard counter and notification primitives.
+    shared: Arc<Shared>,
+    /// Set to `true` once a timeout has been returned. Tells [`Drop`] not to block waiting for
+    /// outstanding guards, since the caller already opted into bounded-wait semantics.
+    detached: bool,
+}
+
+/// A guard forked off a [`Rendezvous`] struct. While it is alive it keeps the owning
+/// [`Rendezvous`] from completing; dropping it (or all clones of it) releases the rendezvous.
+pub struct RendezvousGuard(Arc<Shared>);
 
 impl Rendezvous {
     /// Create a new instance of a [`Rendezvous`] channel.
@@ -100,8 +117,15 @@ impl Rendezvous {
     /// let rendezvous = Rendezvous::new();
     /// ```
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel();
-        Self { tx: Some(tx), rx }
+        Self {
+            shared: Arc::new(Shared {
+                count: Mutex::new(0),
+                cv: Condvar::new(),
+                #[cfg(feature = "tokio")]
+                notify: tokio::sync::Notify::new(),
+            }),
+            detached: false,
+        }
     }
 
     /// Forks a guard off the [`Rendezvous`] channel.
@@ -120,24 +144,21 @@ impl Rendezvous {
     /// ```no_run
     /// use rendezvous::Rendezvous;
     ///
-    /// let mut rendezvous = Rendezvous::new();
+    /// let rendezvous = Rendezvous::new();
     /// let guard = rendezvous.fork_guard();
     /// rendezvous.rendezvous(); // will deadlock
     /// drop(guard);
     /// ```
     pub fn fork_guard(&self) -> RendezvousGuard {
-        if let Some(tx) = &self.tx {
-            #[cfg(feature = "log")]
-            {
-                trace!("Forking rendezvous guard");
-            }
-            RendezvousGuard(tx.clone())
-        } else {
-            unreachable!("Fork called after Rendezvous is dropped")
+        #[cfg(feature = "log")]
+        {
+            trace!("Forking rendezvous guard");
         }
+        *self.shared.lock_count() += 1;
+        RendezvousGuard(self.shared.clone())
     }
 
-    /// Executes the rendezvous process.
+    /// Executes the rendezvous process, blocking until all [`RendezvousGuard`]s are dropped.
     ///
     /// ## Example
     ///
@@ -181,21 +202,25 @@ impl Rendezvous {
     /// ```no_run
     /// use rendezvous::Rendezvous;
     ///
-    /// let mut rendezvous = Rendezvous::new();
+    /// let rendezvous = Rendezvous::new();
     /// let guard = rendezvous.fork_guard();
     /// rendezvous.rendezvous(); // will deadlock
     /// drop(guard);
     /// ```
-    pub fn rendezvous(mut self) {
-        self.rendezvous_internal();
+    pub fn rendezvous(self) {
+        self.wait();
     }
 
     /// Asynchronously executes the rendezvous process.
     ///
+    /// Unlike a blocking wait, this does not occupy a thread: the returned future parks on a
+    /// [`tokio::sync::Notify`] and is woken when the last guard is dropped. Dropping the future
+    /// cancels the wait cleanly.
+    ///
     /// ## Usage notes
     ///
     /// When the rendezvous channel is dropped without a call to [`Rendezvous::rendezvous_async`],
-    /// the currently executed will block until all rendezvous points are reached.
+    /// the dropping scope will block until all rendezvous points are reached.
     ///
     /// ## Example
     ///
@@ -227,7 +252,7 @@ impl Rendezvous {
     ///
     /// // Block until the thread has finished its work.
     /// # tokio_test::block_on(async {
-    /// rendezvous.rendezvous_async().await.ok();
+    /// rendezvous.rendezvous_async().await;
     /// # });
     ///
     /// // The thread finished in time.
@@ -235,12 +260,15 @@ impl Rendezvous {
     /// ```
     #[cfg(feature = "tokio")]
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
-    pub async fn rendezvous_async(self) -> Result<(), JoinError> {
-        let handle = task::spawn_blocking(|| self.rendezvous());
-        handle.await
+    pub async fn rendezvous_async(self) {
+        self.wait_async().await;
     }
 
     /// Executes the rendezvous process with a timeout.
+    ///
+    /// On success the rendezvous is consumed. On a timeout the [`Rendezvous`] is handed back inside
+    /// the error so the caller can retry (e.g. with a longer timeout) or fork additional guards.
+    /// Dropping the returned [`Rendezvous`] after a timeout does **not** block.
     ///
     /// ## Example
     ///
@@ -258,7 +286,7 @@ impl Rendezvous {
     /// }
     ///
     /// // The guard that ensures synchronization across threads.
-    /// let mut rendezvous = Rendezvous::new();
+    /// let rendezvous = Rendezvous::new();
     ///
     /// // A value to mutate in a different thread.
     /// let value = Arc::new(Mutex::new(0u32));
@@ -270,13 +298,17 @@ impl Rendezvous {
     ///     move || slow_worker_fn(guard, value)
     /// });
     ///
-    /// // Wait briefly - this will fail.
-    /// let result = rendezvous.rendezvous_timeout(Duration::from_millis(10));
-    /// assert_eq!(result, Err(RendezvousTimeoutError::Timeout));
+    /// // Wait briefly - this will time out and hand the rendezvous back.
+    /// let rendezvous = match rendezvous.rendezvous_timeout(Duration::from_millis(10)) {
+    ///     Ok(()) => unreachable!("the worker is still sleeping"),
+    ///     Err((rendezvous, err)) => {
+    ///         assert_eq!(err, RendezvousTimeoutError::Timeout);
+    ///         rendezvous
+    ///     }
+    /// };
     ///
     /// // Block until the thread has finished its work, or the timeout occurs.
-    /// let result = rendezvous.rendezvous_timeout(Duration::from_secs(1));
-    /// assert_eq!(result, Ok(()));
+    /// assert!(rendezvous.rendezvous_timeout(Duration::from_secs(1)).is_ok());
     ///
     /// // The thread finished in time.
     /// assert_eq!(*(value.lock().unwrap()), 42);
@@ -290,45 +322,125 @@ impl Rendezvous {
     /// use std::time::Duration;
     /// use rendezvous::{Rendezvous, RendezvousTimeoutError};
     ///
-    /// let mut rendezvous = Rendezvous::new();
+    /// let rendezvous = Rendezvous::new();
     /// let guard = rendezvous.fork_guard();
-    /// assert_eq!(rendezvous.rendezvous_timeout(Duration::from_millis(10)), Err(RendezvousTimeoutError::Timeout));
+    /// let result = rendezvous.rendezvous_timeout(Duration::from_millis(10));
+    /// assert!(matches!(result, Err((_, RendezvousTimeoutError::Timeout))));
     /// drop(guard);
     /// ```
-    pub fn rendezvous_timeout(&mut self, timeout: Duration) -> Result<(), RendezvousTimeoutError> {
-        if let Some(tx) = self.tx.take() {
-            drop(tx);
+    pub fn rendezvous_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<(), (Self, RendezvousTimeoutError)> {
+        if self.wait_timeout(timeout) {
+            Ok(())
         } else {
             #[cfg(feature = "log")]
             {
-                trace!("Rendezvous was called previously, attempting again");
+                debug!("A timeout occurred during a rendezvous");
             }
-        }
-        match self.rx.recv_timeout(timeout) {
-            Ok(_) => Ok(()),
-            Err(err) => match err {
-                RecvTimeoutError::Timeout => {
-                    #[cfg(feature = "log")]
-                    {
-                        debug!("A timeout occurred during a rendezvous");
-                    }
-                    Err(RendezvousTimeoutError::Timeout)
-                }
-                RecvTimeoutError::Disconnected => Ok(()),
-            },
+            self.detached = true;
+            Err((self, RendezvousTimeoutError::Timeout))
         }
     }
 
-    /// Performs a rendezvous operation internally.
+    /// Asynchronously executes the rendezvous process with a timeout.
     ///
-    /// This function borrows `self` and drops the `tx` channel if it exists.
-    /// It then blocks on the `rx` channel, waiting for all [`RendezvousGuard`] instances to be
-    /// dropped, and discards any error that may occur.
-    fn rendezvous_internal(&mut self) {
-        if let Some(tx) = self.tx.take() {
-            drop(tx);
+    /// Behaves like [`Rendezvous::rendezvous_timeout`] but parks on a [`tokio::sync::Notify`]
+    /// instead of blocking a thread. On a timeout the [`Rendezvous`] is handed back for retry.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use std::sync::{Arc, Mutex};
+    /// use std::thread;
+    /// use std::time::Duration;
+    /// use rendezvous::{Rendezvous, RendezvousGuard, RendezvousTimeoutError};
+    ///
+    /// // A slow worker function. Sleeps, then mutates a value.
+    /// fn slow_worker_fn(_guard: RendezvousGuard, mut value: Arc<Mutex<u32>>) {
+    ///     thread::sleep(Duration::from_millis(400));
+    ///     let mut value = value.lock().unwrap();
+    ///     *value = 42;
+    /// }
+    ///
+    /// let rendezvous = Rendezvous::new();
+    /// let value = Arc::new(Mutex::new(0u32));
+    ///
+    /// thread::spawn({
+    ///     let guard = rendezvous.fork_guard();
+    ///     let value = value.clone();
+    ///     move || slow_worker_fn(guard, value)
+    /// });
+    ///
+    /// # tokio_test::block_on(async {
+    /// // Wait briefly - this will time out and hand the rendezvous back.
+    /// let rendezvous = match rendezvous.rendezvous_timeout_async(Duration::from_millis(10)).await {
+    ///     Ok(()) => unreachable!("the worker is still sleeping"),
+    ///     Err((rendezvous, err)) => {
+    ///         assert_eq!(err, RendezvousTimeoutError::Timeout);
+    ///         rendezvous
+    ///     }
+    /// };
+    ///
+    /// // Now wait long enough for the worker to finish.
+    /// assert!(rendezvous.rendezvous_timeout_async(Duration::from_secs(1)).await.is_ok());
+    /// # });
+    ///
+    /// assert_eq!(*(value.lock().unwrap()), 42);
+    /// ```
+    #[cfg(feature = "tokio")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+    pub async fn rendezvous_timeout_async(
+        mut self,
+        timeout: Duration,
+    ) -> Result<(), (Self, RendezvousTimeoutError)> {
+        match tokio::time::timeout(timeout, self.wait_async()).await {
+            Ok(()) => Ok(()),
+            Err(_elapsed) => {
+                #[cfg(feature = "log")]
+                {
+                    debug!("A timeout occurred during a rendezvous");
+                }
+                self.detached = true;
+                Err((self, RendezvousTimeoutError::Timeout))
+            }
         }
-        self.rx.recv().ok();
+    }
+
+    /// Blocks until the outstanding guard count reaches zero.
+    fn wait(&self) {
+        let count = self.shared.lock_count();
+        drop(self.shared.cv.wait_while(count, |c| *c > 0));
+    }
+
+    /// Blocks until the outstanding guard count reaches zero or the timeout elapses.
+    ///
+    /// Returns `true` if the count reached zero, `false` on timeout.
+    fn wait_timeout(&self, timeout: Duration) -> bool {
+        let count = self.shared.lock_count();
+        let (count, result) = self
+            .shared
+            .cv
+            .wait_timeout_while(count, timeout, |c| *c > 0)
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = result;
+        *count == 0
+    }
+
+    /// Asynchronously waits until the outstanding guard count reaches zero.
+    ///
+    /// The [`tokio::sync::Notify`] future is created *before* the count is checked so a guard
+    /// dropping between the check and the await cannot be missed.
+    #[cfg(feature = "tokio")]
+    async fn wait_async(&self) {
+        loop {
+            let notified = self.shared.notify.notified();
+            if *self.shared.lock_count() == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -348,6 +460,7 @@ impl RendezvousGuard {
         {
             trace!("Forking nested rendezvous guard");
         }
+        *self.0.lock_count() += 1;
         RendezvousGuard(self.0.clone())
     }
 
@@ -358,7 +471,7 @@ impl RendezvousGuard {
     /// ```
     /// use rendezvous::Rendezvous;
     ///
-    /// let mut rendezvous = Rendezvous::new();
+    /// let rendezvous = Rendezvous::new();
     /// let guard = rendezvous.fork_guard();
     /// guard.completed();
     /// rendezvous.rendezvous();
@@ -372,13 +485,33 @@ impl Clone for RendezvousGuard {
     }
 }
 
+impl Drop for RendezvousGuard {
+    fn drop(&mut self) {
+        let mut count = self.0.lock_count();
+        *count -= 1;
+        if *count == 0 {
+            // Decrement and notify happen under the lock, so a waiter cannot miss the wakeup.
+            self.0.cv.notify_all();
+            #[cfg(feature = "tokio")]
+            self.0.notify.notify_waiters();
+        }
+    }
+}
+
 impl Drop for Rendezvous {
     fn drop(&mut self) {
+        // After a timeout the caller already accepted a bounded wait; do not block.
+        if self.detached {
+            return;
+        }
+
         #[cfg(all(debug_assertions, feature = "log"))]
-        if self.tx.is_some() {
+        if *self.shared.lock_count() > 0 {
             error!("Implementation error: Rendezvous method not invoked")
         }
-        self.rendezvous_internal()
+
+        // Acts as an implicit guard: block until all rendezvous points are reached.
+        self.wait();
     }
 }
 
@@ -406,6 +539,7 @@ impl Error for RendezvousTimeoutError {}
 mod tests {
     use super::*;
     use std::thread;
+    use std::time::Instant;
 
     #[test]
     fn rendezvous_can_pass_away() {
@@ -421,11 +555,11 @@ mod tests {
 
     #[test]
     fn test_timeout() {
-        let mut rendezvous = Rendezvous::new();
+        let rendezvous = Rendezvous::new();
         let guard = rendezvous.fork_guard();
 
         let result = rendezvous.rendezvous_timeout(Duration::from_millis(100));
-        assert_eq!(result, Err(RendezvousTimeoutError::Timeout));
+        assert!(matches!(result, Err((_, RendezvousTimeoutError::Timeout))));
         drop(guard);
     }
 
@@ -440,5 +574,102 @@ mod tests {
         });
 
         rendezvous.rendezvous();
+    }
+
+    #[test]
+    fn fork_after_timeout_does_not_panic() {
+        let rendezvous = Rendezvous::new();
+        let first = rendezvous.fork_guard();
+
+        // First attempt times out and hands the rendezvous back.
+        let rendezvous = match rendezvous.rendezvous_timeout(Duration::from_millis(10)) {
+            Ok(()) => panic!("guard still held, should have timed out"),
+            Err((rendezvous, err)) => {
+                assert_eq!(err, RendezvousTimeoutError::Timeout);
+                rendezvous
+            }
+        };
+
+        // Forking after a timeout must not panic.
+        let second = rendezvous.fork_guard();
+
+        // Drop both guards on a background thread, then wait again with enough time.
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(first);
+            drop(second);
+        });
+
+        assert!(rendezvous
+            .rendezvous_timeout(Duration::from_secs(1))
+            .is_ok());
+    }
+
+    #[test]
+    fn drop_after_timeout_is_bounded() {
+        let rendezvous = Rendezvous::new();
+        let guard = rendezvous.fork_guard();
+
+        // Hold the guard alive far longer than the test should take.
+        let handle = thread::spawn(move || {
+            let _guard = guard;
+            thread::sleep(Duration::from_secs(5))
+        });
+
+        let rendezvous = match rendezvous.rendezvous_timeout(Duration::from_millis(10)) {
+            Ok(()) => panic!("guard still held, should have timed out"),
+            Err((rendezvous, _)) => rendezvous,
+        };
+
+        // Dropping after a timeout must return promptly, not block on the outstanding guard.
+        let start = Instant::now();
+        drop(rendezvous);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "drop after timeout blocked"
+        );
+
+        // Let the worker thread finish so we do not leak it past the test.
+        handle.join().unwrap();
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn async_rendezvous_completes() {
+        tokio_test::block_on(async {
+            let rendezvous = Rendezvous::new();
+            let guard = rendezvous.fork_guard();
+            thread::spawn(move || {
+                let _guard = guard;
+                thread::sleep(Duration::from_millis(100))
+            });
+            rendezvous.rendezvous_async().await;
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn async_timeout_returns_rendezvous() {
+        tokio_test::block_on(async {
+            let rendezvous = Rendezvous::new();
+            let guard = rendezvous.fork_guard();
+
+            let rendezvous = match rendezvous
+                .rendezvous_timeout_async(Duration::from_millis(10))
+                .await
+            {
+                Ok(()) => panic!("guard still held, should have timed out"),
+                Err((rendezvous, err)) => {
+                    assert_eq!(err, RendezvousTimeoutError::Timeout);
+                    rendezvous
+                }
+            };
+
+            drop(guard);
+            assert!(rendezvous
+                .rendezvous_timeout_async(Duration::from_secs(1))
+                .await
+                .is_ok());
+        });
     }
 }

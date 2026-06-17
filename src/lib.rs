@@ -64,7 +64,17 @@ use log::{debug, error, trace};
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+
+// Under `--cfg loom` the synchronization primitives are swapped for loom's instrumented versions
+// so the model checker can explore every thread interleaving of the sync core.
+#[cfg(loom)]
+use loom::sync::{Arc, Condvar, Mutex, MutexGuard};
+#[cfg(not(loom))]
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+
+// `Duration` is only needed by the timeout APIs, which are excluded from loom builds (loom does not
+// model time).
+#[cfg(any(not(loom), feature = "tokio"))]
 use std::time::Duration;
 
 /// State shared between a [`Rendezvous`] and all of its [`RendezvousGuard`]s.
@@ -328,6 +338,7 @@ impl Rendezvous {
     /// assert!(matches!(result, Err((_, RendezvousTimeoutError::Timeout))));
     /// drop(guard);
     /// ```
+    #[cfg(not(loom))]
     pub fn rendezvous_timeout(
         mut self,
         timeout: Duration,
@@ -409,14 +420,24 @@ impl Rendezvous {
     }
 
     /// Blocks until the outstanding guard count reaches zero.
+    ///
+    /// Uses a manual predicate loop (rather than `Condvar::wait_while`) because loom's `Condvar`
+    /// only exposes `wait`; the loop re-checks the count to absorb spurious wakeups.
     fn wait(&self) {
-        let count = self.shared.lock_count();
-        drop(self.shared.cv.wait_while(count, |c| *c > 0));
+        let mut count = self.shared.lock_count();
+        while *count > 0 {
+            count = self
+                .shared
+                .cv
+                .wait(count)
+                .unwrap_or_else(|e| e.into_inner());
+        }
     }
 
     /// Blocks until the outstanding guard count reaches zero or the timeout elapses.
     ///
     /// Returns `true` if the count reached zero, `false` on timeout.
+    #[cfg(not(loom))]
     fn wait_timeout(&self, timeout: Duration) -> bool {
         let count = self.shared.lock_count();
         let (count, result) = self
@@ -540,6 +561,69 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::Instant;
+
+    /// Many threads concurrently fork and drop guards while the main thread waits. A lost wakeup
+    /// would hang the test; a counter underflow would panic. Run with `--release` for more schedules.
+    #[test]
+    fn stress_sync_concurrent_fork_drop() {
+        for _ in 0..200 {
+            let rendezvous = Rendezvous::new();
+            let mut handles = Vec::new();
+            for _ in 0..64 {
+                let guard = rendezvous.fork_guard();
+                handles.push(thread::spawn(move || drop(guard)));
+            }
+            // Returns only once every guard has dropped (the count reached zero).
+            rendezvous.rendezvous();
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
+    }
+
+    /// Stresses concurrent increments (`fork`) racing decrements (`drop`) and the waiter.
+    #[test]
+    fn stress_sync_nested_fork() {
+        for _ in 0..100 {
+            let rendezvous = Rendezvous::new();
+            let root = rendezvous.fork_guard();
+            let mut handles = Vec::new();
+            for _ in 0..16 {
+                let g = root.clone();
+                handles.push(thread::spawn(move || {
+                    let sub = g.fork();
+                    drop(g);
+                    drop(sub);
+                }));
+            }
+            drop(root);
+            rendezvous.rendezvous();
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
+    }
+
+    /// Exercises the `Notify` cross-thread wakeup and the create-`notified`-before-check loop under
+    /// contention: guards are dropped from OS threads while an async task awaits the rendezvous.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn stress_async_concurrent_drop() {
+        tokio_test::block_on(async {
+            for _ in 0..100 {
+                let rendezvous = Rendezvous::new();
+                let mut handles = Vec::new();
+                for _ in 0..32 {
+                    let guard = rendezvous.fork_guard();
+                    handles.push(thread::spawn(move || drop(guard)));
+                }
+                rendezvous.rendezvous_async().await;
+                for h in handles {
+                    h.join().unwrap();
+                }
+            }
+        });
+    }
 
     #[test]
     fn rendezvous_can_pass_away() {

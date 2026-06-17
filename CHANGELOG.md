@@ -29,6 +29,12 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   into bounded-wait semantics, so the destructor returns immediately.
 - The async wait no longer occupies a blocking-pool thread and is cancellable.
 
+### Internal
+
+- Added [loom](https://docs.rs/loom) model-checking of the synchronous core (`tests/loom.rs`, run
+  with `RUSTFLAGS="--cfg loom" cargo test --release --test loom`) plus high-concurrency stress
+  tests for the sync and async paths.
+
 ## [0.3.0] - 2025-01-25
 
 [0.3.0]: https://github.com/sunsided/rendezvous-rs/releases/tag/v0.3.0

@@ -15,12 +15,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+    - name: Check formatting
+      run: cargo fmt --all -- --check
     - name: Clippy
-      run: cargo clippy
+      run: cargo clippy --all-features --all-targets -- -D warnings
     - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --tests --all-features --verbose
+      run: cargo build --all-features --all-targets --verbose
+    - name: Run tests (no default features)
+      run: cargo test --no-default-features --verbose
+    - name: Run tests (all features)
+      run: cargo test --all-features --all-targets --verbose
     - name: Run doctests
       run: cargo test --doc --all-features --verbose
+    - name: Loom model checks
+      run: cargo test --release --test loom --verbose
+      env:
+        RUSTFLAGS: "--cfg loom"

@@ -27,6 +27,15 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `Rendezvous::outstanding` to read the current guard count.
 - `RendezvousGuard::detached` for a guard that no rendezvous waits on (replaces
   `Option<RendezvousGuard>` plumbing in tests).
+- Guard diagnostics: every guard records the source location that forked it (`#[track_caller]`),
+  and `fork_named` attaches a label that forks and clones inherit. `RendezvousTimeoutError`
+  lists the outstanding guards (`outstanding_guards()`) and names them in its `Display` output;
+  `Rendezvous::outstanding_guards` returns the same at any time. The blocking-drop warning names
+  them too.
+- `RendezvousGuard::wrap` / `Rendezvous::wrap` tie a guard to a future via the allocation-free
+  `GuardedFuture`, which releases the guard when the future completes or is dropped.
+- `rendezvous_until` and `rendezvous_until_async` (`tokio` feature) wait until a deadline
+  (`Instant`) instead of for a duration.
 - `IntoFuture` for `Rendezvous` (`tokio` feature): `rendezvous.await`.
 - `Debug` for `Rendezvous`, `RendezvousGuard` and `RendezvousTimeoutError`.
 - `tracing` feature to emit diagnostics through `tracing` instead of `log`.
@@ -35,7 +44,14 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Documentation: the README no longer describes the old `mpsc`-based design, and the crate-level
-  example now actually runs as a doctest.
+  example now actually runs as a doctest. `cargo doc` without the `tokio` feature no longer has
+  broken links.
+
+### Documentation
+
+- Crate docs gained a comparison with `std::sync::Barrier`, `crossbeam`'s `WaitGroup` and
+  `tokio-util`'s `TaskTracker`, plus sections on async graceful shutdown, diagnosing stuck guards
+  and common pitfalls. `Rendezvous` is searchable as `WaitGroup`, `latch` and `barrier`.
 
 ## [0.4.0] - 2026-06-17
 

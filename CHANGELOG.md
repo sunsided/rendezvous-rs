@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file.
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.0] - Unreleased
+## [0.5.0] - 2026-10-24
 
 [0.5.0]: https://github.com/sunsided/rendezvous-rs/releases/tag/v0.5.0
 

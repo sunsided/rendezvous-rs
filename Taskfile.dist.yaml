@@ -104,6 +104,11 @@ tasks:
       - task: test:doc
       - task: test:loom
 
+  example:
+    desc: Run the graceful-shutdown example — pass `-- --stuck` or `-- --fail-start`
+    cmds:
+      - cargo run --example graceful_shutdown --features tokio -- {{.CLI_ARGS}}
+
   docs:
     desc: Build rustdoc (all features, no deps)
     aliases: [doc]

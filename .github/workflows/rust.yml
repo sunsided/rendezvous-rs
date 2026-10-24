@@ -24,6 +24,11 @@ jobs:
       run: cargo build --all-features --all-targets --verbose
     - name: Run tests (no default features)
       run: cargo test --no-default-features --verbose
+    - name: Run tests (per feature)
+      run: |
+        for feature in log tracing tokio; do
+          cargo test --features "$feature" --verbose
+        done
     - name: Run tests (all features)
       run: cargo test --all-features --all-targets --verbose
     - name: Run doctests
@@ -32,3 +37,25 @@ jobs:
       run: cargo test --release --test loom --verbose
       env:
         RUSTFLAGS: "--cfg loom"
+
+  msrv:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.85
+    - name: Run tests on MSRV (all features)
+      run: cargo test --all-features --verbose
+
+  docs:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@nightly
+    - name: Build docs as docs.rs does
+      run: cargo doc --all-features --no-deps
+      env:
+        RUSTDOCFLAGS: "--cfg docsrs -D warnings"

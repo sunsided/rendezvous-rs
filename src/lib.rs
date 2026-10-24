@@ -98,8 +98,9 @@
 //! # }
 //! ```
 //!
-//! The `graceful_shutdown` example in the repository shows the complete pattern, including the
-//! startup-failure path (`cargo run --example graceful_shutdown --features tokio -- --stuck`).
+//! The `graceful_shutdown` example in the repository shows the complete pattern: run it with
+//! `cargo run --example graceful_shutdown --features tokio`, add `-- --stuck` to see a timeout
+//! name a hung worker, or `-- --fail-start` for the startup-failure path.
 //!
 //! ## Diagnosing stuck guards
 //!
@@ -1582,7 +1583,6 @@ mod tests {
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(1));
         assert_eq!(rendezvous.outstanding(), 0, "future is still alive here");
-        assert_eq!(rendezvous.outstanding(), 0);
         rendezvous.rendezvous();
     }
 

@@ -74,7 +74,7 @@ tasks:
   test:features:
     desc: Run the test suite once per individual feature
     cmds:
-      - for: [log, tracing, tokio]
+      - for: [log, tracing]
         cmd: cargo test --features {{.ITEM}}
 
   test:msrv:
@@ -86,12 +86,12 @@ tasks:
       - cargo +1.85 test --all-features
 
   test:loom:
-    desc: Model-check the sync core with loom (exhaustive thread interleavings)
+    desc: Model-check the sync and async core with loom (exhaustive thread interleavings)
     preconditions:
       - sh: command -v cargo
         msg: "cargo not found — install Rust from https://rustup.rs/"
     env:
-      RUSTFLAGS: "--cfg loom"
+      RUSTFLAGS: "--cfg rendezvous_loom"
     cmds:
       - cargo test --release --test loom
 
@@ -107,7 +107,7 @@ tasks:
   example:
     desc: Run the graceful-shutdown example — pass `-- --stuck` or `-- --fail-start`
     cmds:
-      - cargo run --example graceful_shutdown --features tokio -- {{.CLI_ARGS}}
+      - cargo run --example graceful_shutdown -- {{.CLI_ARGS}}
 
   docs:
     desc: Build rustdoc (all features, no deps)

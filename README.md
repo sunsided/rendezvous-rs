@@ -17,8 +17,9 @@ cargo add rendezvous
 
 ## Highlights
 
-* **Sync and async in one type.** Block a thread with `rendezvous()`, or `.await` it with the
-  `tokio` feature. Workers can be OS threads, async tasks, or both.
+* **Sync and async in one type, on any runtime.** Block a thread with `rendezvous()`, or
+  `.await` it on tokio, smol or any other executor. The crate depends on no async runtime, and
+  workers can be OS threads, async tasks, or both.
 * **Bounded waits that can be retried.** On timeout you get the `Rendezvous` back, detached so
   dropping it never blocks.
 * **Reports stuck workers.** Guards record where they were forked (and an optional name), so a
@@ -33,9 +34,9 @@ semantics and common pitfalls.
 
 ## Crate features
 
-* `tokio` - asynchronous waits: `rendezvous_async`, `rendezvous_timeout_async`,
-  `rendezvous_until_async`, and `.await` on a `Rendezvous`.
 * `tracing` / `log` - diagnostics through the respective crate (`tracing` wins if both are on).
+
+There are no runtime features: async support is always available and works on any executor.
 
 ## Example usage
 
@@ -74,7 +75,77 @@ rendezvous.rendezvous();
 assert_eq!(*(value.lock().unwrap()), 42);
 ```
 
-## Graceful shutdown (async)
+## Async runtimes
+
+Async waiting (`rendezvous.rendezvous_async().await`, or just `rendezvous.await`) only uses the
+standard `Waker` machinery. A *bounded* async wait needs a timer, which `rendezvous_or` takes as a
+plain future from whatever runtime you use; the timer's output is ignored.
+
+### tokio
+
+```rust
+use std::time::Duration;
+use rendezvous::Rendezvous;
+
+#[tokio::main]
+async fn main() {
+    let rendezvous = Rendezvous::new();
+    let guard = rendezvous.fork_guard();
+    tokio::spawn(async move { drop(guard) });
+
+    // Wait for at most 15 seconds.
+    let budget = tokio::time::sleep(Duration::from_secs(15));
+    assert!(rendezvous.rendezvous_or(budget).await.is_ok());
+
+    // Or until a deadline, e.g. one budget shared by several shutdown phases.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let rendezvous = Rendezvous::new();
+    assert!(rendezvous.rendezvous_or(tokio::time::sleep_until(deadline)).await.is_ok());
+}
+```
+
+### smol / async-io
+
+smol re-exports `async_io::Timer` as `smol::Timer`.
+
+```rust
+use std::time::{Duration, Instant};
+use rendezvous::Rendezvous;
+
+async_io::block_on(async {
+    let rendezvous = Rendezvous::new();
+    let guard = rendezvous.fork_guard();
+    std::thread::spawn(move || drop(guard));
+
+    // Wait for at most 15 seconds.
+    let budget = async_io::Timer::after(Duration::from_secs(15));
+    assert!(rendezvous.rendezvous_or(budget).await.is_ok());
+
+    // Or until a deadline.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let rendezvous = Rendezvous::new();
+    assert!(rendezvous.rendezvous_or(async_io::Timer::at(deadline)).await.is_ok());
+});
+```
+
+### Any executor
+
+[`futures-timer`](https://docs.rs/futures-timer) drives its `Delay` from its own thread, so it
+works on every executor, including minimal ones like `futures::executor::block_on`:
+
+```rust
+use std::time::Duration;
+use rendezvous::Rendezvous;
+
+async fn shutdown(rendezvous: Rendezvous) {
+    let budget = futures_timer::Delay::new(Duration::from_secs(15));
+    if let Err(err) = rendezvous.rendezvous_or(budget).await {
+        eprintln!("{err}");
+    }
+}
+```
+
+## Graceful shutdown (tokio)
 
 ```rust
 use std::time::Duration;
@@ -93,7 +164,8 @@ async fn run(stop: tokio::sync::watch::Receiver<bool>) {
     }
 
     // ... once the stop signal was sent:
-    if let Err(err) = rendezvous.rendezvous_timeout_async(Duration::from_secs(15)).await {
+    let budget = tokio::time::sleep(Duration::from_secs(15));
+    if let Err(err) = rendezvous.rendezvous_or(budget).await {
         // The rendezvous inside `err` is detached; dropping it does not block.
         eprintln!("{err}");
     }
@@ -104,7 +176,7 @@ The [`graceful_shutdown`](examples/graceful_shutdown.rs) example shows the full 
 `CancellationToken`, a stuck worker and a startup failure:
 
 ```shell
-cargo run --example graceful_shutdown --features tokio -- --stuck
+cargo run --example graceful_shutdown -- --stuck
 ```
 
 ## Drop semantics
@@ -112,7 +184,8 @@ cargo run --example graceful_shutdown --features tokio -- --stuck
 Dropping a `Rendezvous` that was never waited on **blocks** until all guards are released. In
 async code, or on early-return error paths where workers will never be told to stop, opt out:
 
-* a timed-out `rendezvous_timeout`/`rendezvous_timeout_async` hands back a detached rendezvous;
+* a timed-out bounded wait (`rendezvous_timeout`, `rendezvous_until`, `rendezvous_or`) hands back a
+  detached rendezvous;
 * `rendezvous_async` (and `.await`) detach immediately, so a cancelled wait never blocks;
 * `Rendezvous::detach()` gives up explicitly without waiting.
 

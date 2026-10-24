@@ -26,7 +26,7 @@ jobs:
       run: cargo test --no-default-features --verbose
     - name: Run tests (per feature)
       run: |
-        for feature in log tracing tokio; do
+        for feature in log tracing; do
           cargo test --features "$feature" --verbose
         done
     - name: Run tests (all features)
@@ -36,7 +36,7 @@ jobs:
     - name: Loom model checks
       run: cargo test --release --test loom --verbose
       env:
-        RUSTFLAGS: "--cfg loom"
+        RUSTFLAGS: "--cfg rendezvous_loom"
 
   msrv:
 

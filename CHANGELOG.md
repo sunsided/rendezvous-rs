@@ -11,15 +11,21 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Breaking:** `RendezvousTimeoutError` is now a struct that carries the detached `Rendezvous`
   (`into_rendezvous()`) and the number of guards still outstanding (`outstanding()`).
-  `rendezvous_timeout` and `rendezvous_timeout_async` return `Result<(), RendezvousTimeoutError>`
-  instead of `Result<(), (Self, RendezvousTimeoutError)>`, so the error works with `?`.
-- **Breaking:** `rendezvous_async` and `rendezvous_timeout_async` are now plain functions returning
-  `impl Future + Send`. They detach the rendezvous at call time, so dropping the future (e.g. a
+  `rendezvous_timeout` returns `Result<(), RendezvousTimeoutError>` instead of
+  `Result<(), (Self, RendezvousTimeoutError)>`, so the error works with `?`.
+- **Breaking:** The crate no longer depends on tokio, and the `tokio` feature is gone. Async
+  waiting is always available and runtime-agnostic: `rendezvous_async` and `.await` on a
+  `Rendezvous` return a `RendezvousFuture` that registers the task's waker with the rendezvous
+  instead of using `tokio::sync::Notify`, and run on any executor without boxing.
+- **Breaking:** `rendezvous_timeout_async` is removed. Bounded async waits take the runtime's timer
+  as a future instead: `rendezvous.rendezvous_or(tokio::time::sleep(timeout))`, or
+  `tokio::time::sleep_until(deadline)` for a deadline. Drop `features = ["tokio"]` from the
+  dependency declaration.
+- **Breaking:** Async waits detach the rendezvous at call time, so dropping the future (e.g. a
   losing `select!` branch) no longer falls back to the blocking destructor.
 - Dropping a non-detached `Rendezvous` with outstanding guards now logs a warning in all builds
   (previously a debug-only `error!`).
 - Moved to edition 2024; the minimum supported Rust version is now 1.85.
-- The `tokio` dependency no longer enables the `rt` feature.
 
 ### Added
 
@@ -34,11 +40,13 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   them too.
 - `RendezvousGuard::wrap` / `Rendezvous::wrap` tie a guard to a future via the allocation-free
   `GuardedFuture`, which releases the guard when the future completes or is dropped.
-- `rendezvous_until` and `rendezvous_until_async` (`tokio` feature) wait until a deadline
-  (`Instant`) instead of for a duration.
+- `rendezvous_or(timer)`: a bounded async wait that takes the timer as any future, so it works
+  with tokio (`tokio::time::sleep`), smol (`async_io::Timer`), `futures-timer` or any other
+  runtime.
+- `rendezvous_until` waits until a deadline (`Instant`) instead of for a duration.
 - `examples/graceful_shutdown.rs`: tokio workers with a `CancellationToken`, a bounded wait, a
   stuck worker and a startup failure.
-- `IntoFuture` for `Rendezvous` (`tokio` feature): `rendezvous.await`.
+- `IntoFuture` for `Rendezvous`: `rendezvous.await`, on any executor.
 - `Debug` for `Rendezvous`, `RendezvousGuard` and `RendezvousTimeoutError`.
 - `tracing` feature to emit diagnostics through `tracing` instead of `log`.
 - `#[must_use]` on `RendezvousGuard` and the constructors/getters.
@@ -46,12 +54,17 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Documentation: the README no longer describes the old `mpsc`-based design, and the crate-level
-  example now actually runs as a doctest. `cargo doc` without the `tokio` feature no longer has
-  broken links.
+  example now actually runs as a doctest.
+
+### Internal
+
+- The loom model checks now cover the async wait as well, and run under a crate-specific
+  `--cfg rendezvous_loom` (was `--cfg loom`), since a global `loom` cfg also switches
+  dependencies such as tokio into their loom mode.
 
 ### Documentation
 
-- Crate docs gained a comparison with `std::sync::Barrier`, `crossbeam`'s `WaitGroup` and
+- Crate docs gained an "Async runtimes" section, a comparison with `std::sync::Barrier`, `crossbeam`'s `WaitGroup` and
   `tokio-util`'s `TaskTracker`, plus sections on async graceful shutdown, diagnosing stuck guards
   and common pitfalls. `Rendezvous` is searchable as `WaitGroup`, `latch` and `barrier`.
 - README badges (crates.io, docs.rs, CI, MSRV, license) and a stated MSRV policy.

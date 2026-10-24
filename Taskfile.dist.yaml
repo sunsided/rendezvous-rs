@@ -109,6 +109,21 @@ tasks:
     cmds:
       - cargo run --example graceful_shutdown -- {{.CLI_ARGS}}
 
+  example:check:
+    desc: Run the example in every mode and check its exit codes and output (as CI does)
+    cmds:
+      - cargo run --example graceful_shutdown
+      - |
+        if output=$(cargo run --example graceful_shutdown -- --stuck 2>&1); then
+          echo "$output"; echo "expected a non-zero exit when a worker hangs"; exit 1
+        fi
+        echo "$output" | grep -qF 'stuck-worker (forked at examples/graceful_shutdown.rs:'
+      - |
+        if output=$(cargo run --example graceful_shutdown -- --fail-start 2>&1); then
+          echo "$output"; echo "expected a non-zero exit on startup failure"; exit 1
+        fi
+        echo "$output" | grep -qF 'startup failed'
+
   docs:
     desc: Build rustdoc (all features, no deps)
     aliases: [doc]
@@ -141,3 +156,4 @@ tasks:
       - task: fmt:check
       - task: lint
       - task: test:matrix
+      - task: example:check

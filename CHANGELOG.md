@@ -3,6 +3,40 @@
 All notable changes to this project will be documented in this file.
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - Unreleased
+
+[0.5.0]: https://github.com/sunsided/rendezvous-rs/releases/tag/v0.5.0
+
+### Changed
+
+- **Breaking:** `RendezvousTimeoutError` is now a struct that carries the detached `Rendezvous`
+  (`into_rendezvous()`) and the number of guards still outstanding (`outstanding()`).
+  `rendezvous_timeout` and `rendezvous_timeout_async` return `Result<(), RendezvousTimeoutError>`
+  instead of `Result<(), (Self, RendezvousTimeoutError)>`, so the error works with `?`.
+- **Breaking:** `rendezvous_async` and `rendezvous_timeout_async` are now plain functions returning
+  `impl Future + Send`. They detach the rendezvous at call time, so dropping the future (e.g. a
+  losing `select!` branch) no longer falls back to the blocking destructor.
+- Dropping a non-detached `Rendezvous` with outstanding guards now logs a warning in all builds
+  (previously a debug-only `error!`).
+- Moved to edition 2024; the minimum supported Rust version is now 1.85.
+- The `tokio` dependency no longer enables the `rt` feature.
+
+### Added
+
+- `Rendezvous::detach` to give up on outstanding guards without blocking.
+- `Rendezvous::outstanding` to read the current guard count.
+- `RendezvousGuard::detached` for a guard that no rendezvous waits on (replaces
+  `Option<RendezvousGuard>` plumbing in tests).
+- `IntoFuture` for `Rendezvous` (`tokio` feature): `rendezvous.await`.
+- `Debug` for `Rendezvous`, `RendezvousGuard` and `RendezvousTimeoutError`.
+- `tracing` feature to emit diagnostics through `tracing` instead of `log`.
+- `#[must_use]` on `RendezvousGuard` and the constructors/getters.
+
+### Fixed
+
+- Documentation: the README no longer describes the old `mpsc`-based design, and the crate-level
+  example now actually runs as a doctest.
+
 ## [0.4.0] - 2026-06-17
 
 [0.4.0]: https://github.com/sunsided/rendezvous-rs/releases/tag/v0.4.0

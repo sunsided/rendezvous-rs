@@ -1,13 +1,14 @@
 //! A tokio service that drains its background workers on shutdown, within a time budget.
 //!
 //! ```sh
-//! cargo run --example graceful_shutdown --features tokio                  # clean shutdown
-//! cargo run --example graceful_shutdown --features tokio -- --stuck       # a worker hangs
-//! cargo run --example graceful_shutdown --features tokio -- --fail-start  # startup error
+//! cargo run --example graceful_shutdown                  # clean shutdown
+//! cargo run --example graceful_shutdown -- --stuck       # a worker hangs
+//! cargo run --example graceful_shutdown -- --fail-start  # startup error
 //! ```
 //!
 //! The pattern: a `CancellationToken` *tells* workers to stop, the `Rendezvous` *waits* for them,
 //! and every worker's guard is tied to its task with `wrap`, so it is released when the task ends.
+//! The crate itself is runtime-agnostic; tokio only supplies the executor and the timer here.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -56,14 +57,17 @@ async fn main() -> ExitCode {
     println!("shutting down");
     shutdown.cancel();
 
-    match rendezvous.rendezvous_timeout_async(SHUTDOWN_BUDGET).await {
+    match rendezvous
+        .rendezvous_or(tokio::time::sleep(SHUTDOWN_BUDGET))
+        .await
+    {
         Ok(()) => {
             println!("all workers drained, goodbye");
             ExitCode::SUCCESS
         }
         Err(err) => {
             // e.g. "rendezvous timed out with 1 outstanding guard(s):
-            //       stuck-worker (forked at examples/graceful_shutdown.rs:39:33)"
+            //       stuck-worker (forked at examples/graceful_shutdown.rs:40:33)"
             eprintln!("{err}");
             ExitCode::FAILURE
         }

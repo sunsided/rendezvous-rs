@@ -74,7 +74,7 @@ tasks:
   test:features:
     desc: Run the test suite once per individual feature
     cmds:
-      - for: [log, tracing, tokio]
+      - for: [log, tracing]
         cmd: cargo test --features {{.ITEM}}
 
   test:msrv:
@@ -86,12 +86,12 @@ tasks:
       - cargo +1.85 test --all-features
 
   test:loom:
-    desc: Model-check the sync core with loom (exhaustive thread interleavings)
+    desc: Model-check the sync and async core with loom (exhaustive thread interleavings)
     preconditions:
       - sh: command -v cargo
         msg: "cargo not found — install Rust from https://rustup.rs/"
     env:
-      RUSTFLAGS: "--cfg loom"
+      RUSTFLAGS: "--cfg rendezvous_loom"
     cmds:
       - cargo test --release --test loom
 
@@ -107,7 +107,22 @@ tasks:
   example:
     desc: Run the graceful-shutdown example — pass `-- --stuck` or `-- --fail-start`
     cmds:
-      - cargo run --example graceful_shutdown --features tokio -- {{.CLI_ARGS}}
+      - cargo run --example graceful_shutdown -- {{.CLI_ARGS}}
+
+  example:check:
+    desc: Run the example in every mode and check its exit codes and output (as CI does)
+    cmds:
+      - cargo run --example graceful_shutdown
+      - |
+        if output=$(cargo run --example graceful_shutdown -- --stuck 2>&1); then
+          echo "$output"; echo "expected a non-zero exit when a worker hangs"; exit 1
+        fi
+        echo "$output" | grep -qF 'stuck-worker (forked at examples/graceful_shutdown.rs:'
+      - |
+        if output=$(cargo run --example graceful_shutdown -- --fail-start 2>&1); then
+          echo "$output"; echo "expected a non-zero exit on startup failure"; exit 1
+        fi
+        echo "$output" | grep -qF 'startup failed'
 
   docs:
     desc: Build rustdoc (all features, no deps)
@@ -141,3 +156,4 @@ tasks:
       - task: fmt:check
       - task: lint
       - task: test:matrix
+      - task: example:check

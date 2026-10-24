@@ -26,17 +26,44 @@ jobs:
       run: cargo test --no-default-features --verbose
     - name: Run tests (per feature)
       run: |
-        for feature in log tracing tokio; do
+        for feature in log tracing; do
           cargo test --features "$feature" --verbose
         done
     - name: Run tests (all features)
       run: cargo test --all-features --all-targets --verbose
     - name: Run doctests
       run: cargo test --doc --all-features --verbose
-    - name: Loom model checks
+    - name: Run example (clean shutdown)
+      run: cargo run --example graceful_shutdown
+    - name: Run example (stuck worker is reported)
+      run: |
+        if output=$(cargo run --example graceful_shutdown -- --stuck 2>&1); then
+          echo "$output"
+          echo "::error::expected a non-zero exit when a worker hangs"
+          exit 1
+        fi
+        echo "$output"
+        echo "$output" | grep -qF 'stuck-worker (forked at examples/graceful_shutdown.rs:'
+    - name: Run example (startup failure)
+      run: |
+        if output=$(cargo run --example graceful_shutdown -- --fail-start 2>&1); then
+          echo "$output"
+          echo "::error::expected a non-zero exit on startup failure"
+          exit 1
+        fi
+        echo "$output"
+        echo "$output" | grep -qF 'startup failed'
+
+  loom:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Loom model checks (sync and async core)
       run: cargo test --release --test loom --verbose
       env:
-        RUSTFLAGS: "--cfg loom"
+        RUSTFLAGS: "--cfg rendezvous_loom"
 
   msrv:
 

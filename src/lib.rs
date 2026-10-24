@@ -6,10 +6,11 @@
 //! typical use is a graceful-shutdown barrier: wait, within a time budget, until every background
 //! worker has drained.
 //!
-//! Internally this is a registry of live guards protected by a [`Mutex`] and a [`Condvar`] (plus a
-//! [`Notify`][notify] when the `tokio` feature is enabled). The waiter never relinquishes its
-//! own handle, so forking a guard always works — even after a timed-out wait — and a timeout never
-//! leaves the [`Rendezvous`] in a state where dropping it blocks forever.
+//! Internally this is a registry of live guards protected by a [`Mutex`], with a [`Condvar`] for
+//! blocking waits and a list of task wakers for async waits, so async waits run on any executor
+//! without depending on a particular runtime. The waiter never relinquishes its own handle, so
+//! forking a guard always works — even after a timed-out wait — and a timeout never leaves the
+//! [`Rendezvous`] in a state where dropping it blocks forever.
 //!
 //! ## When to use this crate
 //!
@@ -18,7 +19,7 @@
 //! | Who waits                           | one owner        | every participant      | every clone             | any holder                 |
 //! | Participant count                   | dynamic          | fixed up front         | dynamic                 | dynamic                    |
 //! | Blocking wait                       | yes              | yes                    | yes                     | no                         |
-//! | Async wait                          | yes (`tokio`)    | no                     | no                      | yes                        |
+//! | Async wait                          | any executor     | no                     | no                      | yes                        |
 //! | Bounded wait that can be retried    | yes              | no                     | no                      | via `tokio::time::timeout` |
 //! | Reports *which* participants hang   | yes              | no                     | no                      | no                         |
 //!
@@ -71,7 +72,6 @@
 //! each guard to its task with [`RendezvousGuard::wrap`] so it is released when the task ends:
 //!
 //! ```rust
-//! # #[cfg(feature = "tokio")]
 //! # async fn example() {
 //! use std::time::Duration;
 //! use rendezvous::Rendezvous;
@@ -91,15 +91,93 @@
 //!
 //! // ... later, on SIGTERM:
 //! let _ = stop_tx.send(true);
-//! if let Err(err) = rendezvous.rendezvous_timeout_async(Duration::from_secs(15)).await {
+//! let budget = tokio::time::sleep(Duration::from_secs(15));
+//! if let Err(err) = rendezvous.rendezvous_or(budget).await {
 //!     // e.g. "rendezvous timed out with 1 outstanding guard(s): worker-2 (forked at src/main.rs:16:26)"
 //!     eprintln!("{err}");
 //! }
 //! # }
 //! ```
 //!
-//! The `graceful_shutdown` example in the repository shows the complete pattern: run it with
-//! `cargo run --example graceful_shutdown --features tokio`, add `-- --stuck` to see a timeout
+//! ## Async runtimes
+//!
+//! The crate does not depend on any async runtime. The async waits
+//! ([`Rendezvous::rendezvous_async`], `.await` on a [`Rendezvous`], and
+//! [`Rendezvous::rendezvous_or`]) only use the standard [`Waker`] machinery, so they run on any
+//! executor. The one thing a *bounded* async wait needs from a runtime is a timer, and
+//! [`Rendezvous::rendezvous_or`] takes it as a plain future. Its output is ignored, so any future
+//! works as the "give up" signal, such as a second shutdown request.
+//!
+//! ### tokio
+//!
+//! ```rust
+//! use std::time::Duration;
+//! use rendezvous::Rendezvous;
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let rendezvous = Rendezvous::new();
+//!     let guard = rendezvous.fork_guard();
+//!     tokio::spawn(async move { drop(guard) });
+//!
+//!     // Wait for at most 15 seconds.
+//!     let budget = tokio::time::sleep(Duration::from_secs(15));
+//!     assert!(rendezvous.rendezvous_or(budget).await.is_ok());
+//!
+//!     // Or until a deadline, e.g. one budget shared by several shutdown phases.
+//!     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+//!     let rendezvous = Rendezvous::new();
+//!     assert!(rendezvous.rendezvous_or(tokio::time::sleep_until(deadline)).await.is_ok());
+//! }
+//! ```
+//!
+//! ### smol / async-io
+//!
+//! smol re-exports [`async_io::Timer`](https://docs.rs/async-io/latest/async_io/struct.Timer.html)
+//! as `smol::Timer`.
+//!
+//! ```rust
+//! use std::time::{Duration, Instant};
+//! use rendezvous::Rendezvous;
+//!
+//! async_io::block_on(async {
+//!     let rendezvous = Rendezvous::new();
+//!     let guard = rendezvous.fork_guard();
+//!     std::thread::spawn(move || drop(guard));
+//!
+//!     // Wait for at most 15 seconds.
+//!     let budget = async_io::Timer::after(Duration::from_secs(15));
+//!     assert!(rendezvous.rendezvous_or(budget).await.is_ok());
+//!
+//!     // Or until a deadline.
+//!     let deadline = Instant::now() + Duration::from_secs(15);
+//!     let rendezvous = Rendezvous::new();
+//!     assert!(rendezvous.rendezvous_or(async_io::Timer::at(deadline)).await.is_ok());
+//! });
+//! ```
+//!
+//! ### Any executor
+//!
+//! [`futures-timer`](https://docs.rs/futures-timer) drives its `Delay` from its own thread, so it
+//! works on every executor, including minimal ones like `futures::executor::block_on`:
+//!
+//! ```rust
+//! use std::time::Duration;
+//! use rendezvous::Rendezvous;
+//!
+//! # async_io::block_on(async {
+//! let rendezvous = Rendezvous::new();
+//! let guard = rendezvous.fork_named("slow");
+//!
+//! let budget = futures_timer::Delay::new(Duration::from_millis(10));
+//! let err = rendezvous.rendezvous_or(budget).await.expect_err("the guard is still alive");
+//! assert_eq!(err.outstanding_guards()[0].name(), Some("slow"));
+//! drop(guard);
+//! # });
+//! ```
+//!
+//! The `graceful_shutdown` example in the repository shows the complete pattern on tokio: run it
+//! with `cargo run --example graceful_shutdown`, add `-- --stuck` to see a timeout
 //! name a hung worker, or `-- --fail-start` for the startup-failure path.
 //!
 //! ## Diagnosing stuck guards
@@ -118,9 +196,10 @@
 //! destructor **blocks** until every outstanding guard is released. This is convenient in
 //! synchronous code but a hazard in async code, where it parks an executor thread. To opt out:
 //!
-//! * use [`Rendezvous::rendezvous_timeout`] (or its async/deadline variants) — a rendezvous handed
-//!   back on timeout is detached and drops without blocking;
-//! * use [`rendezvous_async`][rendezvous_async] (or `.await` the rendezvous directly) — the rendezvous
+//! * use a bounded wait ([`Rendezvous::rendezvous_timeout`], [`Rendezvous::rendezvous_until`] or
+//!   [`Rendezvous::rendezvous_or`]) — a rendezvous handed back on timeout is detached and drops
+//!   without blocking;
+//! * use [`Rendezvous::rendezvous_async`] (or `.await` the rendezvous directly) — the rendezvous
 //!   is detached as soon as the future is created, so cancelling the future never blocks;
 //! * call [`Rendezvous::detach`] to give up on the outstanding guards explicitly, e.g. on an
 //!   early-return error path.
@@ -143,63 +222,31 @@
 //!
 //! * `log` - Emits diagnostics through the `log` crate.
 //! * `tracing` - Emits diagnostics through the `tracing` crate (takes precedence over `log`).
-//! * `tokio` - Enables the asynchronous waits [`rendezvous_async`][rendezvous_async],
-//!   [`rendezvous_timeout_async`][rendezvous_timeout_async] and
-//!   [`rendezvous_until_async`][rendezvous_until_async], and `.await` on a [`Rendezvous`]. They
-//!   park on a tokio [`Notify`][notify] instead of blocking a thread.
 //!
-// Link targets for items that only exist with the `tokio` feature: intra-doc links when they do,
-// docs.rs URLs otherwise, so `cargo doc` without the feature has no broken links.
-#![cfg_attr(feature = "tokio", doc = "[notify]: tokio::sync::Notify")]
-#![cfg_attr(
-    not(feature = "tokio"),
-    doc = "[notify]: https://docs.rs/tokio/latest/tokio/sync/struct.Notify.html"
-)]
-#![cfg_attr(
-    feature = "tokio",
-    doc = "[rendezvous_async]: Rendezvous::rendezvous_async"
-)]
-#![cfg_attr(
-    not(feature = "tokio"),
-    doc = "[rendezvous_async]: https://docs.rs/rendezvous/latest/rendezvous/struct.Rendezvous.html#method.rendezvous_async"
-)]
-#![cfg_attr(
-    feature = "tokio",
-    doc = "[rendezvous_timeout_async]: Rendezvous::rendezvous_timeout_async"
-)]
-#![cfg_attr(
-    not(feature = "tokio"),
-    doc = "[rendezvous_timeout_async]: https://docs.rs/rendezvous/latest/rendezvous/struct.Rendezvous.html#method.rendezvous_timeout_async"
-)]
-#![cfg_attr(
-    feature = "tokio",
-    doc = "[rendezvous_until_async]: Rendezvous::rendezvous_until_async"
-)]
-#![cfg_attr(
-    not(feature = "tokio"),
-    doc = "[rendezvous_until_async]: https://docs.rs/rendezvous/latest/rendezvous/struct.Rendezvous.html#method.rendezvous_until_async"
-)]
+//! There are no runtime features; see [Async runtimes](#async-runtimes).
+
 // only enables the `doc_cfg` feature when
 // the `docsrs` configuration attribute is defined
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::panic::Location;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
-// Under `--cfg loom` the synchronization primitives are swapped for loom's instrumented versions
+// Under `--cfg rendezvous_loom` the synchronization primitives are swapped for loom's instrumented versions
 // so the model checker can explore every thread interleaving of the sync core.
-#[cfg(loom)]
+#[cfg(rendezvous_loom)]
 use loom::sync::{Arc, Condvar, Mutex, MutexGuard};
-#[cfg(not(loom))]
+#[cfg(not(rendezvous_loom))]
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
-// The time types are only needed by the timeout APIs, which are excluded from loom builds (loom
-// does not model time).
-#[cfg(any(not(loom), feature = "tokio"))]
+// The time types are only needed by the blocking timeout APIs, which are excluded from loom builds
+// (loom does not model time).
+#[cfg(not(rendezvous_loom))]
 use std::time::{Duration, Instant};
 
 /// Emits a diagnostic through `tracing` if enabled, falling back to `log`; a no-op otherwise.
@@ -218,19 +265,19 @@ struct Shared {
     state: Mutex<State>,
     /// Notifies synchronous waiters when the last guard is released.
     cv: Condvar,
-    /// Notifies asynchronous waiters when the last guard is released.
-    #[cfg(feature = "tokio")]
-    notify: tokio::sync::Notify,
 }
 
 /// The registry of live guards. The owning [`Rendezvous`] does *not* register itself; the
 /// rendezvous completes once `live` is empty.
 struct State {
-    /// The ID handed to the next forked guard. IDs increase monotonically, so iterating `live`
-    /// yields guards in fork order.
+    /// The ID handed to the next forked guard or waiting future. IDs increase monotonically, so
+    /// iterating `live` yields guards in fork order.
     next_id: u64,
     /// Every guard that has not been dropped yet, keyed by its ID.
     live: BTreeMap<u64, OutstandingGuard>,
+    /// The wakers of pending async waits, keyed by the waiting future's ID. Drained and woken when
+    /// the last guard is released.
+    wakers: BTreeMap<u64, Waker>,
 }
 
 impl Shared {
@@ -243,14 +290,20 @@ impl Shared {
 }
 
 impl State {
+    /// Allocates a fresh ID.
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
     /// Registers a new guard and returns its ID.
     fn insert(
         &mut self,
         name: Option<std::sync::Arc<str>>,
         location: &'static Location<'static>,
     ) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.next_id();
         self.live.insert(id, OutstandingGuard { name, location });
         id
     }
@@ -311,10 +364,9 @@ impl Rendezvous {
                 state: Mutex::new(State {
                     next_id: 0,
                     live: BTreeMap::new(),
+                    wakers: BTreeMap::new(),
                 }),
                 cv: Condvar::new(),
-                #[cfg(feature = "tokio")]
-                notify: tokio::sync::Notify::new(),
             }),
             detached: false,
         }
@@ -511,8 +563,9 @@ impl Rendezvous {
 
     /// Asynchronously executes the rendezvous process.
     ///
-    /// Unlike a blocking wait, this does not occupy a thread: the returned future parks on a
-    /// [`tokio::sync::Notify`] and is woken when the last guard is dropped.
+    /// Unlike a blocking wait, this does not occupy a thread: the returned [`RendezvousFuture`]
+    /// registers the polling task's waker and is woken when the last guard is dropped. It works on
+    /// any executor; no runtime feature is required.
     ///
     /// The rendezvous is detached as soon as this method is called, so dropping the returned
     /// future — before or during the wait — cancels the wait without blocking.
@@ -555,12 +608,8 @@ impl Rendezvous {
     /// // The thread finished in time.
     /// assert_eq!(*(value.lock().unwrap()), 42);
     /// ```
-    #[cfg(feature = "tokio")]
-    pub fn rendezvous_async(mut self) -> impl Future<Output = ()> + Send {
-        // Detach eagerly (not inside the future) so that a future dropped before its first poll
-        // does not fall back to the blocking destructor either.
-        self.detached = true;
-        async move { self.wait_async().await }
+    pub fn rendezvous_async(self) -> RendezvousFuture {
+        RendezvousFuture::new(self)
     }
 
     /// Executes the rendezvous process with a timeout.
@@ -626,7 +675,7 @@ impl Rendezvous {
     /// assert!(result.is_err());
     /// drop(guard);
     /// ```
-    #[cfg(not(loom))]
+    #[cfg(not(rendezvous_loom))]
     pub fn rendezvous_timeout(mut self, timeout: Duration) -> Result<(), RendezvousTimeoutError> {
         match self.wait_timeout(timeout) {
             Ok(()) => Ok(()),
@@ -656,15 +705,23 @@ impl Rendezvous {
     /// std::thread::spawn(move || drop(guard));
     /// assert!(rendezvous.rendezvous_until(deadline).is_ok());
     /// ```
-    #[cfg(not(loom))]
+    #[cfg(not(rendezvous_loom))]
     pub fn rendezvous_until(self, deadline: Instant) -> Result<(), RendezvousTimeoutError> {
         self.rendezvous_timeout(deadline.saturating_duration_since(Instant::now()))
     }
 
-    /// Asynchronously executes the rendezvous process with a timeout.
+    /// Asynchronously executes the rendezvous process, giving up when `timer` completes.
     ///
-    /// Behaves like [`Rendezvous::rendezvous_timeout`] but parks on a [`tokio::sync::Notify`]
-    /// instead of blocking a thread. On a timeout the [`Rendezvous`] is handed back for retry.
+    /// This is the bounded async wait, and it works with any runtime: pass the runtime's sleep
+    /// future, such as `tokio::time::sleep(duration)`, `async_io::Timer::after(duration)` (smol)
+    /// or `futures_timer::Delay::new(duration)`, or any other future that should end the wait,
+    /// e.g. a second shutdown signal. The timer's output is ignored. For a deadline, use the
+    /// runtime's deadline timer (`tokio::time::sleep_until`, `async_io::Timer::at`). See
+    /// [Async runtimes](crate#async-runtimes) for complete examples.
+    ///
+    /// Resolves like [`Rendezvous::rendezvous_timeout`]: `Ok(())` once every guard is released, or
+    /// a [`RendezvousTimeoutError`] carrying the detached rendezvous and the outstanding guards if
+    /// `timer` completes first. If both are ready at the same time, the rendezvous wins.
     ///
     /// Like [`Rendezvous::rendezvous_async`], the rendezvous is detached as soon as this method is
     /// called, so dropping the returned future cancels the wait without blocking.
@@ -672,88 +729,27 @@ impl Rendezvous {
     /// ## Example
     ///
     /// ```
-    /// use std::sync::{Arc, Mutex};
-    /// use std::thread;
     /// use std::time::Duration;
-    /// use rendezvous::{Rendezvous, RendezvousGuard};
-    ///
-    /// // A slow worker function. Sleeps, then mutates a value.
-    /// fn slow_worker_fn(_guard: RendezvousGuard, value: Arc<Mutex<u32>>) {
-    ///     thread::sleep(Duration::from_millis(400));
-    ///     let mut value = value.lock().unwrap();
-    ///     *value = 42;
-    /// }
-    ///
-    /// let rendezvous = Rendezvous::new();
-    /// let value = Arc::new(Mutex::new(0u32));
-    ///
-    /// thread::spawn({
-    ///     let guard = rendezvous.fork_guard();
-    ///     let value = value.clone();
-    ///     move || slow_worker_fn(guard, value)
-    /// });
-    ///
-    /// # tokio_test::block_on(async {
-    /// // Wait briefly - this will time out and hand the rendezvous back.
-    /// let rendezvous = rendezvous
-    ///     .rendezvous_timeout_async(Duration::from_millis(10))
-    ///     .await
-    ///     .expect_err("the worker is still sleeping")
-    ///     .into_rendezvous();
-    ///
-    /// // Now wait long enough for the worker to finish.
-    /// assert!(rendezvous.rendezvous_timeout_async(Duration::from_secs(1)).await.is_ok());
-    /// # });
-    ///
-    /// assert_eq!(*(value.lock().unwrap()), 42);
-    /// ```
-    #[cfg(feature = "tokio")]
-    pub fn rendezvous_timeout_async(
-        mut self,
-        timeout: Duration,
-    ) -> impl Future<Output = Result<(), RendezvousTimeoutError>> + Send {
-        // See `rendezvous_async`: detach before the future exists so cancellation never blocks.
-        self.detached = true;
-        async move {
-            match tokio::time::timeout(timeout, self.wait_async()).await {
-                Ok(()) => Ok(()),
-                Err(_elapsed) => self.check_after_timeout(),
-            }
-        }
-    }
-
-    /// Asynchronously executes the rendezvous process with a deadline.
-    ///
-    /// Behaves like [`Rendezvous::rendezvous_timeout_async`], but takes the point in time at which
-    /// to give up; see [`Rendezvous::rendezvous_until`].
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use std::time::{Duration, Instant};
     /// use rendezvous::Rendezvous;
     ///
-    /// # tokio_test::block_on(async {
-    /// let deadline = Instant::now() + Duration::from_secs(1);
-    ///
+    /// # async_io::block_on(async {
     /// let rendezvous = Rendezvous::new();
-    /// let guard = rendezvous.fork_guard();
-    /// std::thread::spawn(move || drop(guard));
-    /// assert!(rendezvous.rendezvous_until_async(deadline).await.is_ok());
+    /// let guard = rendezvous.fork_named("slow");
+    ///
+    /// let err = rendezvous
+    ///     .rendezvous_or(async_io::Timer::after(Duration::from_millis(10)))
+    ///     .await
+    ///     .expect_err("the guard is still alive");
+    /// assert_eq!(err.outstanding_guards()[0].name(), Some("slow"));
+    ///
+    /// drop(guard);
+    /// assert!(err.into_rendezvous().rendezvous_or(std::future::pending::<()>()).await.is_ok());
     /// # });
     /// ```
-    #[cfg(feature = "tokio")]
-    pub fn rendezvous_until_async(
-        mut self,
-        deadline: Instant,
-    ) -> impl Future<Output = Result<(), RendezvousTimeoutError>> + Send {
-        // See `rendezvous_async`: detach before the future exists so cancellation never blocks.
-        self.detached = true;
-        async move {
-            match tokio::time::timeout_at(deadline.into(), self.wait_async()).await {
-                Ok(()) => Ok(()),
-                Err(_elapsed) => self.check_after_timeout(),
-            }
+    pub fn rendezvous_or<T: Future>(self, timer: T) -> RendezvousOr<T> {
+        RendezvousOr {
+            wait: Some(RendezvousFuture::new(self)),
+            timer,
         }
     }
 
@@ -775,7 +771,7 @@ impl Rendezvous {
     /// Blocks until no guards are outstanding or the timeout elapses.
     ///
     /// Returns the outstanding guards on timeout.
-    #[cfg(not(loom))]
+    #[cfg(not(rendezvous_loom))]
     fn wait_timeout(&self, timeout: Duration) -> Result<(), Vec<OutstandingGuard>> {
         let state = self.shared.lock();
         let (state, _) = self
@@ -787,33 +783,6 @@ impl Rendezvous {
             Ok(())
         } else {
             Err(state.snapshot())
-        }
-    }
-
-    /// Asynchronously waits until no guards are outstanding.
-    ///
-    /// The [`tokio::sync::Notify`] future is created *before* the registry is checked so a guard
-    /// dropping between the check and the await cannot be missed.
-    #[cfg(feature = "tokio")]
-    async fn wait_async(&self) {
-        loop {
-            let notified = self.shared.notify.notified();
-            if self.shared.lock().live.is_empty() {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    /// Re-checks the registry after an async timer fired. The last guard may have been released
-    /// in the meantime, in which case the rendezvous succeeded after all.
-    #[cfg(feature = "tokio")]
-    fn check_after_timeout(self) -> Result<(), RendezvousTimeoutError> {
-        let outstanding = self.shared.lock().snapshot();
-        if outstanding.is_empty() {
-            Ok(())
-        } else {
-            Err(RendezvousTimeoutError::new(self, outstanding))
         }
     }
 }
@@ -845,13 +814,12 @@ impl Debug for Rendezvous {
 /// rendezvous.await;
 /// # });
 /// ```
-#[cfg(feature = "tokio")]
 impl IntoFuture for Rendezvous {
     type Output = ();
-    type IntoFuture = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
+    type IntoFuture = RendezvousFuture;
 
     fn into_future(self) -> Self::IntoFuture {
-        Box::pin(self.rendezvous_async())
+        self.rendezvous_async()
     }
 }
 
@@ -980,10 +948,16 @@ impl Drop for RendezvousGuard {
         let mut state = self.shared.lock();
         state.live.remove(&self.id);
         if state.live.is_empty() {
-            // Removal and notify happen under the lock, so a waiter cannot miss the wakeup.
+            // Removal and notification happen under the lock, so a blocking waiter cannot miss the
+            // wakeup, and an async waiter either sees the empty registry when it polls or has its
+            // waker in `wakers` by now.
             self.shared.cv.notify_all();
-            #[cfg(feature = "tokio")]
-            self.shared.notify.notify_waiters();
+            let wakers = std::mem::take(&mut state.wakers);
+            // Wake outside the lock: a waker may run arbitrary executor code.
+            drop(state);
+            for waker in wakers.into_values() {
+                waker.wake();
+            }
         }
     }
 }
@@ -1043,6 +1017,160 @@ impl<F> Debug for GuardedFuture<F> {
     }
 }
 
+/// Future returned by [`Rendezvous::rendezvous_async`] and by `.await` on a [`Rendezvous`].
+///
+/// Completes once every guard has been released. It registers the polling task's
+/// [`Waker`] with the rendezvous instead of relying on a runtime primitive, so it works on any
+/// executor. The rendezvous it owns is detached: dropping the future unregisters the waker and
+/// never blocks.
+#[must_use = "futures do nothing unless polled"]
+pub struct RendezvousFuture {
+    rendezvous: Rendezvous,
+    waiter: Waiter,
+}
+
+impl RendezvousFuture {
+    fn new(mut rendezvous: Rendezvous) -> Self {
+        // Detach eagerly (not on first poll) so that a future dropped before it is ever polled
+        // does not fall back to the blocking destructor either.
+        rendezvous.detached = true;
+        let waiter = Waiter {
+            shared: rendezvous.shared.clone(),
+            id: None,
+        };
+        Self { rendezvous, waiter }
+    }
+
+    /// Ends the wait after a timer fired. The last guard may have been released since the last
+    /// poll, in which case the rendezvous succeeded after all.
+    fn finish_timed_out(self) -> Result<(), RendezvousTimeoutError> {
+        let Self { rendezvous, waiter } = self;
+        drop(waiter);
+        let outstanding = rendezvous.shared.lock().snapshot();
+        if outstanding.is_empty() {
+            Ok(())
+        } else {
+            Err(RendezvousTimeoutError::new(rendezvous, outstanding))
+        }
+    }
+}
+
+impl Future for RendezvousFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.get_mut().waiter.poll_complete(cx.waker()) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Debug for RendezvousFuture {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RendezvousFuture")
+            .field("rendezvous", &self.rendezvous)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A waiting future's registration in [`State::wakers`]. Unregisters on drop, so cancelled waits
+/// do not accumulate stale wakers.
+struct Waiter {
+    shared: Arc<Shared>,
+    /// The key in [`State::wakers`], allocated on the first pending poll.
+    id: Option<u64>,
+}
+
+impl Waiter {
+    /// Returns `true` once no guards are outstanding; otherwise (re-)registers `waker` and returns
+    /// `false`.
+    ///
+    /// The check and the registration happen under the same lock that [`RendezvousGuard`]'s
+    /// `Drop` takes to remove the last guard and drain the wakers, so a release cannot slip in
+    /// between them and be missed.
+    fn poll_complete(&mut self, waker: &Waker) -> bool {
+        let mut state = self.shared.lock();
+        if state.live.is_empty() {
+            if let Some(id) = self.id.take() {
+                state.wakers.remove(&id);
+            }
+            return true;
+        }
+
+        let id = match self.id {
+            Some(id) => id,
+            None => *self.id.insert(state.next_id()),
+        };
+        match state.wakers.entry(id) {
+            Entry::Occupied(mut entry) => {
+                if !entry.get().will_wake(waker) {
+                    entry.insert(waker.clone());
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(waker.clone());
+            }
+        }
+        false
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.shared.lock().wakers.remove(&id);
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Future returned by [`Rendezvous::rendezvous_or`].
+    ///
+    /// Resolves to `Ok(())` once every guard is released, or to a [`RendezvousTimeoutError`] when
+    /// the timer completes first.
+    #[must_use = "futures do nothing unless polled"]
+    pub struct RendezvousOr<T> {
+        wait: Option<RendezvousFuture>,
+        #[pin]
+        timer: T,
+    }
+}
+
+impl<T: Future> Future for RendezvousOr<T> {
+    type Output = Result<(), RendezvousTimeoutError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let wait = this
+            .wait
+            .as_mut()
+            .expect("`RendezvousOr` polled after completion");
+
+        // The rendezvous is checked first, so a timer that fires at the same moment does not turn
+        // a completed rendezvous into a timeout.
+        if Pin::new(wait).poll(cx).is_ready() {
+            *this.wait = None;
+            return Poll::Ready(Ok(()));
+        }
+        if this.timer.poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+
+        let wait = this.wait.take().expect("checked above");
+        Poll::Ready(wait.finish_timed_out())
+    }
+}
+
+impl<T> Debug for RendezvousOr<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RendezvousOr")
+            .field("wait", &self.wait)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A guard that was still alive when it was inspected, e.g. when a bounded wait timed out.
 ///
 /// See [Diagnosing stuck guards](crate#diagnosing-stuck-guards).
@@ -1096,8 +1224,6 @@ pub struct RendezvousTimeoutError {
 }
 
 impl RendezvousTimeoutError {
-    // Only the timeout APIs construct this, and loom builds exclude the synchronous one.
-    #[cfg(any(not(loom), feature = "tokio"))]
     fn new(rendezvous: Rendezvous, outstanding: Vec<OutstandingGuard>) -> Self {
         let error = Self {
             rendezvous,
@@ -1188,8 +1314,8 @@ impl<T: Display> Debug for AsDisplay<T> {
 #[cfg(doctest)]
 struct MustUseDoctests;
 
-/// Runs the README examples as doctests. The async example needs the `tokio` feature.
-#[cfg(all(doctest, feature = "tokio"))]
+/// Runs the README examples as doctests.
+#[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
@@ -1240,12 +1366,11 @@ mod tests {
         }
     }
 
-    /// Exercises the `Notify` cross-thread wakeup and the create-`notified`-before-check loop under
-    /// contention: guards are dropped from OS threads while an async task awaits the rendezvous.
-    #[cfg(feature = "tokio")]
+    /// Exercises the cross-thread waker handoff under contention: guards are dropped from OS
+    /// threads while an async task awaits the rendezvous. Runs on async-io's executor, not tokio's.
     #[test]
     fn stress_async_concurrent_drop() {
-        tokio_test::block_on(async {
+        async_io::block_on(async {
             for _ in 0..100 {
                 let rendezvous = Rendezvous::new();
                 let mut handles = Vec::new();
@@ -1550,6 +1675,8 @@ mod tests {
         assert_auto_traits::<RendezvousGuard>();
         assert_auto_traits::<RendezvousTimeoutError>();
         assert_auto_traits::<OutstandingGuard>();
+        assert_auto_traits::<RendezvousFuture>();
+        assert_auto_traits::<RendezvousOr<std::future::Pending<()>>>();
     }
 
     #[test]
@@ -1586,7 +1713,6 @@ mod tests {
         rendezvous.rendezvous();
     }
 
-    #[cfg(feature = "tokio")]
     #[test]
     fn async_rendezvous_completes() {
         tokio_test::block_on(async {
@@ -1600,7 +1726,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "tokio")]
     #[test]
     fn rendezvous_is_awaitable() {
         tokio_test::block_on(async {
@@ -1614,22 +1739,24 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "tokio")]
+    /// The bounded async wait with tokio's deadline timer, in both outcomes.
     #[test]
-    fn async_deadline() {
+    fn rendezvous_or_with_tokio_deadline() {
         tokio_test::block_on(async {
             let rendezvous = Rendezvous::new();
             let guard = rendezvous.fork_named("late");
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
             let err = rendezvous
-                .rendezvous_until_async(Instant::now() + Duration::from_millis(10))
+                .rendezvous_or(tokio::time::sleep_until(deadline))
                 .await
                 .expect_err("guard still held, should have timed out");
             assert_eq!(err.outstanding_guards()[0].name(), Some("late"));
 
             drop(guard);
+            let now = tokio::time::Instant::now();
             assert!(
                 err.into_rendezvous()
-                    .rendezvous_until_async(Instant::now())
+                    .rendezvous_or(tokio::time::sleep_until(now))
                     .await
                     .is_ok()
             );
@@ -1638,7 +1765,6 @@ mod tests {
 
     /// Dropping an async wait (e.g. the losing branch of a `select!`) must not fall back to the
     /// blocking destructor, which would park the executor thread.
-    #[cfg(feature = "tokio")]
     #[test]
     fn dropping_async_wait_does_not_block() {
         let start = Instant::now();
@@ -1650,18 +1776,122 @@ mod tests {
 
         let rendezvous = Rendezvous::new();
         guards.push(rendezvous.fork_guard());
-        drop(rendezvous.rendezvous_timeout_async(Duration::from_secs(60)));
-
-        let rendezvous = Rendezvous::new();
-        guards.push(rendezvous.fork_guard());
-        drop(rendezvous.rendezvous_until_async(Instant::now() + Duration::from_secs(60)));
+        drop(rendezvous.rendezvous_or(std::future::pending::<()>()));
 
         let rendezvous = Rendezvous::new();
         guards.push(rendezvous.fork_guard());
         drop(rendezvous.into_future());
 
+        // A future that was polled (and registered its waker) must unregister on drop too.
+        let rendezvous = Rendezvous::new();
+        guards.push(rendezvous.fork_guard());
+        let mut future = rendezvous.rendezvous_async();
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut future).poll(&mut cx).is_pending());
+        drop(future);
+        assert!(guards.last().unwrap().shared.lock().wakers.is_empty());
+
         assert!(start.elapsed() < Duration::from_secs(1), "drop blocked");
         drop(guards);
+    }
+
+    /// Counts how often it is woken.
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl CountingWaker {
+        fn new() -> (std::sync::Arc<Self>, Waker) {
+            let counter = std::sync::Arc::new(Self(std::sync::atomic::AtomicUsize::new(0)));
+            (counter.clone(), Waker::from(counter))
+        }
+
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Walks the waker bookkeeping by hand: one registration per future, replaced when the task
+    /// is polled with a different waker, and woken exactly once, by the last guard release.
+    #[test]
+    fn async_wait_registers_and_wakes_once() {
+        let rendezvous = Rendezvous::new();
+        let first = rendezvous.fork_guard();
+        let last = first.fork();
+        let mut future = rendezvous.rendezvous_async();
+
+        let (stale, stale_waker) = CountingWaker::new();
+        let mut stale_cx = Context::from_waker(&stale_waker);
+        assert!(Pin::new(&mut future).poll(&mut stale_cx).is_pending());
+
+        // Re-polling with a different waker (the task moved) replaces the registration.
+        let (counter, waker) = CountingWaker::new();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut future).poll(&mut cx).is_pending());
+        assert!(Pin::new(&mut future).poll(&mut cx).is_pending());
+        let registered = last.shared.lock().wakers.len();
+        assert_eq!(registered, 1, "re-polls must not add wakers");
+
+        // Releasing one of two guards does not wake.
+        drop(first);
+        assert_eq!(counter.count(), 0);
+
+        drop(last);
+        assert_eq!(
+            counter.count(),
+            1,
+            "the last release wakes the current waker"
+        );
+        assert_eq!(stale.count(), 0, "the replaced waker is not woken");
+        assert_eq!(Pin::new(&mut future).poll(&mut cx), Poll::Ready(()));
+    }
+
+    #[test]
+    fn rendezvous_or_times_out_when_the_timer_wins() {
+        let rendezvous = Rendezvous::new();
+        let guard = rendezvous.fork_named("held");
+
+        let err = async_io::block_on(rendezvous.rendezvous_or(std::future::ready(())))
+            .expect_err("guard still held, should have timed out");
+        assert_eq!(err.outstanding_guards()[0].name(), Some("held"));
+
+        // Retrying works, and a completed rendezvous wins over an already-ready timer.
+        let rendezvous = err.into_rendezvous();
+        drop(guard);
+        assert!(async_io::block_on(rendezvous.rendezvous_or(std::future::ready(()))).is_ok());
+    }
+
+    /// The bounded async wait with a non-tokio runtime's timer, in both outcomes.
+    #[test]
+    fn rendezvous_or_with_async_io_timer() {
+        async_io::block_on(async {
+            let rendezvous = Rendezvous::new();
+            let guard = rendezvous.fork_guard();
+            let err = rendezvous
+                .rendezvous_or(async_io::Timer::after(Duration::from_millis(10)))
+                .await
+                .expect_err("guard still held, should have timed out");
+
+            let rendezvous = err.into_rendezvous();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                drop(guard);
+            });
+            assert!(
+                rendezvous
+                    .rendezvous_or(async_io::Timer::after(Duration::from_secs(5)))
+                    .await
+                    .is_ok()
+            );
+        });
     }
 
     /// Drops a rendezvous with one outstanding guard that a background thread releases shortly

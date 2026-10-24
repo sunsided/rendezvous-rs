@@ -71,6 +71,20 @@ tasks:
     cmds:
       - cargo test --no-default-features
 
+  test:features:
+    desc: Run the test suite once per individual feature
+    cmds:
+      - for: [log, tracing, tokio]
+        cmd: cargo test --features {{.ITEM}}
+
+  test:msrv:
+    desc: Run the test suite on the minimum supported Rust version (1.85)
+    preconditions:
+      - sh: rustup run 1.85 rustc --version
+        msg: "Rust 1.85 not installed — rustup toolchain install 1.85"
+    cmds:
+      - cargo +1.85 test --all-features
+
   test:loom:
     desc: Model-check the sync core with loom (exhaustive thread interleavings)
     preconditions:
@@ -85,15 +99,28 @@ tasks:
     desc: Run every feature combination, doctests, and loom
     cmds:
       - task: test:no-features
+      - task: test:features
       - task: test
       - task: test:doc
       - task: test:loom
+
+  example:
+    desc: Run the graceful-shutdown example — pass `-- --stuck` or `-- --fail-start`
+    cmds:
+      - cargo run --example graceful_shutdown --features tokio -- {{.CLI_ARGS}}
 
   docs:
     desc: Build rustdoc (all features, no deps)
     aliases: [doc]
     cmds:
       - cargo doc --all-features --no-deps
+
+  docs:check:
+    desc: Build rustdoc as docs.rs does (nightly, warnings as errors)
+    env:
+      RUSTDOCFLAGS: "--cfg docsrs -D warnings"
+    cmds:
+      - cargo +nightly doc --all-features --no-deps
 
   docs:open:
     desc: Build and open rustdoc in the browser
